@@ -1,0 +1,468 @@
+"""
+Specialist Agents — 4 AI dengan tugas terbagi, token-efficient.
+
+Prinsip:
+- Setiap AI terima data MINIMAL yang relevan dengan tugasnya saja
+- Tidak ada AI yang handle semua sekaligus
+- Diskusi hanya saat loss, bukan setiap siklus
+- Semua pakai watchlist trigger — tidak mantau terus menerus
+
+Alur:
+  AI-1 (H1 Analyst)   → baca struktur H1, FVG, OB → set watchlist level H1
+  AI-2 (IDM Hunter)    → baca M5, cari IDM → set notif di high/low IDM
+  AI-3 (BOS/MSS Guard) → saat IDM disentuh → konfirmasi BOS lanjut atau MSS
+  AI-4 (Entry Sniper)  → saat BOS terkonfirmasi → entry presisi, SL MSNR, TP target
+"""
+
+import os
+import json
+import logging
+from datetime import datetime, timezone
+from groq import Groq
+
+logger = logging.getLogger(__name__)
+
+
+def _parse_json(raw: str) -> dict | list | None:
+    """Parse JSON dari response model, handle berbagai format."""
+    import re
+    if not raw:
+        return None
+    raw = raw.strip()
+    try:
+        return json.loads(raw)
+    except Exception:
+        pass
+    match = re.search(r'```(?:json)?\s*(\{[\s\S]*?\}|\[[\s\S]*?\])\s*```', raw)
+    if match:
+        try:
+            return json.loads(match.group(1))
+        except Exception:
+            pass
+    match = re.search(r'(\{[\s\S]*\})', raw)
+    if match:
+        try:
+            return json.loads(match.group(1))
+        except Exception:
+            pass
+    match = re.search(r'(\[[\s\S]*\])', raw)
+    if match:
+        try:
+            return json.loads(match.group(1))
+        except Exception:
+            pass
+    return None
+
+
+def _call(client: Groq, model: str, prompt: str, max_tokens: int = 400, temp: float = 0.2) -> str:
+    """Panggil Groq API, return teks mentah."""
+    try:
+        resp = client.chat.completions.create(
+            model=model,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=temp,
+            max_tokens=max_tokens,
+        )
+        return resp.choices[0].message.content.strip()
+    except Exception as e:
+        err = str(e)
+        if "429" in err or "rate_limit" in err.lower():
+            logger.warning(f"[RATE LIMIT] {model}: {err[:100]}")
+        elif "413" in err:
+            logger.warning(f"[PAYLOAD TOO LARGE] {model} — prompt terlalu panjang")
+        else:
+            logger.error(f"[API ERROR] {model}: {err[:100]}")
+        return ""
+
+
+# ══════════════════════════════════════════════════════════
+# AI-1: H1 ANALYST
+# Tugas: deteksi BOS H1 → pantau FVG H1 → serahkan ke AI-2
+# Tidak ada IDM H1. Alur: BOS H1 → FVG H1 wick touch → IDM M5
+# ══════════════════════════════════════════════════════════
+
+def ai1_h1_analysis(client: Groq, model: str, ict_data: dict, current_price: float,
+                     bos_h1: dict = None, idm_h1: dict = None,
+                     ob_sweep: dict = None) -> dict:
+    """
+    AI-1 narasi BOS H1. Tidak ada IDM H1.
+    Setelah BOS, tunggu FVG H1 disentuh wick → serahkan ke AI-2 cari IDM M5.
+    """
+    bos_type  = bos_h1.get("type",  "") if bos_h1 else ""
+    bos_level = bos_h1.get("level", 0)  if bos_h1 else 0
+    bias      = "bullish" if bos_type == "bullish_bos" else ("bearish" if bos_type == "bearish_bos" else "neutral")
+
+    fvgs = ict_data.get("h1_fvg", [])
+    fresh_fvgs = [f for f in fvgs if not f.get("filled")]
+    fvg_info = " | ".join([f"{f['type']} {f['low']:.2f}–{f['high']:.2f}" for f in fresh_fvgs[:3]]) or "tidak ada"
+
+    liq = ict_data.get("liquidity_pools", {})
+    liq_info = f"Liq High={liq.get('recent_high',0):.2f} Low={liq.get('recent_low',0):.2f}"
+
+    prompt = f"""Kamu adalah Hiura, AI analis struktur H1. Kamu baru saja cek kondisi market.
+
+DATA H1 (sudah diproses Python):
+- BOS: {"TIDAK ADA" if not bos_h1 else f"{bos_type} terkonfirmasi di {bos_level:.2f}"}
+- Bias: {bias}
+- FVG H1 fresh: {fvg_info}
+- {liq_info}
+- Harga saat ini: {current_price:.2f}
+
+TUGASMU:
+Kirim pesan singkat ke grup (gaya WA, santai tapi tajam). Ceritakan apa yang kamu lihat di H1.
+{"Belum ada BOS — sampaikan kondisi saat ini." if not bos_h1 else
+ f"Ada BOS {bias} — sampaikan BOS di mana, FVG yang relevan, dan bahwa kamu tunggu wick touch FVG." if fresh_fvgs else
+ f"Ada BOS {bias} tapi tidak ada FVG fresh — sampaikan ini."}
+
+Max 3 kalimat. Jangan sebut IDM. Tulis HANYA pesanmu (plain text)."""
+
+    raw = _call(client, model, prompt, max_tokens=150, temp=0.75)
+    chat_msg = raw.strip() if raw else (
+        f"Hiura: {'belum ada BOS H1.' if not bos_h1 else f'BOS {bias} H1 di {bos_level:.2f}. FVG: {fvg_info}.'}"
+    )
+
+    logger.info(f"[AI-1] BOS={bos_type} @ {bos_level:.2f} | FVG fresh={len(fresh_fvgs)}")
+
+    return {
+        "bias": bias,
+        "bos_found": bool(bos_h1),
+        "bos_type": bos_type,
+        "bos_level": bos_level,
+        "reason": f"BOS {bias} H1 @ {bos_level:.2f}" if bos_h1 else "no BOS",
+        "chat_msg": chat_msg,
+        "watchlist": [],
+        "fakeout_detected": False,
+    }
+
+
+# ══════════════════════════════════════════════════════════
+# AI-2: IDM HUNTER (M5)
+# Dipanggil setelah IDM H1 disentuh & swing range sudah ditandai AI-1
+# BOS bullish H1 → cari IDM BEARISH di M5 (retrace turun dalam range SH-SL)
+# BOS bearish H1 → cari IDM BULLISH di M5 (retrace naik dalam range SH-SL)
+# Token: sangat ringan — Python sudah hitung IDM, AI hanya narasi + fallback
+# ══════════════════════════════════════════════════════════
+
+def ai2_idm_hunter(client: Groq, model: str, ict_data: dict, idm_m5: dict | None,
+                   swing_range: dict, current_price: float) -> dict:
+    """
+    AI-2 set watchlist IDM M5 dalam range SH-SL dari AI-1.
+    idm_m5: hasil Python find_idm_in_range() — sudah presisi
+    swing_range: {"swing_high", "swing_low", "m5_idm_direction", "range_valid"}
+    """
+    sh  = swing_range.get("swing_high", 0)
+    sl  = swing_range.get("swing_low", 0)
+    m5_dir = swing_range.get("m5_idm_direction", "bearish")
+    range_valid = swing_range.get("range_valid", False)
+    watchlist = []
+
+    if idm_m5 and range_valid:
+        idm_level = idm_m5.get("level", 0)
+        idm_type  = idm_m5.get("type", "")
+
+        # IDM bearish M5 (BOS bullish H1): harga retrace turun sentuh level ini
+        # IDM bullish M5 (BOS bearish H1): harga retrace naik sentuh level ini
+        watchlist.append({
+            "level": idm_level,
+            "condition": "touch",
+            "reason": f"IDM {idm_type} M5 @ {idm_level:.2f} dalam range {sl:.2f}–{sh:.2f}",
+            "for_ai": "AI-3",
+            "phase": "waiting_idm_m5_touch",
+        })
+        chat_msg = (
+            f"Senanan: IDM {m5_dir} M5 ketemu di {idm_level:.2f} "
+            f"(range {sl:.2f}–{sh:.2f}). Pantau level ini."
+        )
+        logger.info(f"[AI-2] IDM M5 {m5_dir} @ {idm_level:.2f} | range {sl:.2f}–{sh:.2f}")
+        return {
+            "idm_valid": True,
+            "idm_level": idm_level,
+            "idm_direction": m5_dir,
+            "chat_msg": chat_msg,
+            "watchlist": watchlist,
+        }
+
+    # IDM M5 belum terbentuk dalam range — minta AI konfirmasi swing
+    # dan set watchlist sementara di SL/SH range sebagai level pantau
+    if range_valid:
+        # Pantau batas range: kalau break SL (bullish) atau SH (bearish) = invalidasi
+        if m5_dir == "bearish":
+            # BOS bullish H1 — kalau SL (swing_low) break ke bawah = invalidasi
+            watchlist.append({
+                "level": sl,
+                "condition": "break_below",
+                "reason": f"Batas bawah range — break SL {sl:.2f} = invalidasi BOS bullish H1",
+                "for_ai": "AI-1",
+                "phase": "waiting_idm_m5_touch",
+            })
+        else:
+            watchlist.append({
+                "level": sh,
+                "condition": "break_above",
+                "reason": f"Batas atas range — break SH {sh:.2f} = invalidasi BOS bearish H1",
+                "for_ai": "AI-1",
+                "phase": "waiting_idm_m5_touch",
+            })
+        chat_msg = (
+            f"Senanan: IDM {m5_dir} M5 belum terbentuk di range {sl:.2f}–{sh:.2f}. "
+            f"Pantau batas range dulu."
+        )
+        logger.info(f"[AI-2] IDM M5 belum ada | range {sl:.2f}–{sh:.2f} | pantau batas")
+    else:
+        chat_msg = "Senanan: range dari AI-1 belum valid, tunggu FVG H1 disentuh dulu."
+        logger.warning("[AI-2] swing_range tidak valid")
+
+    return {
+        "idm_valid": False,
+        "idm_level": 0,
+        "idm_direction": m5_dir,
+        "chat_msg": chat_msg,
+        "watchlist": watchlist,
+    }
+
+
+# ══════════════════════════════════════════════════════════
+# AI-3: BOS/MSS GUARD
+# Tugas: setelah IDM disentuh → konfirmasi BOS lanjut atau MSS
+# Output: keputusan BOS/MSS + instruksi ke AI-2 atau AI-4
+# Token: ringan — hanya konteks IDM + candle terbaru M5
+# ══════════════════════════════════════════════════════════
+
+def ai3_bos_mss_guard(client: Groq, model: str, ict_data: dict,
+                      bos_result: dict | None, idm_level: float,
+                      bias: str, current_price: float) -> dict:
+    """
+    AI-3 konfirmasi BOS atau MSS setelah IDM disentuh.
+    Return: {"decision": "bos|mss|wait", "chat_msg": str, "next": "AI-2|AI-4", "watchlist": [...]}
+    """
+    mss = ict_data.get("m5_mss")
+
+    bos_text = "Tidak ada BOS M5 terdeteksi"
+    if bos_result:
+        bos_text = f"BOS M5 {bos_result['type']}: level={bos_result['level']:.2f} close={bos_result['close']:.2f}"
+
+    mss_text = "Tidak ada MSS terdeteksi"
+    if mss:
+        mss_text = f"MSS {mss.get('type','')}: level={mss.get('level',0):.2f}"
+
+    prompt = f"""Kamu adalah AI-3, penjaga BOS/MSS di M5. Singkat dan tegas.
+
+KONTEKS:
+Bias H1: {bias}
+IDM yang baru disentuh: {idm_level:.2f}
+Harga saat ini: {current_price:.2f}
+
+STATUS M5:
+BOS M5: {bos_text}
+MSS M5: {mss_text}
+
+ATURAN KEPUTUSAN:
+- Jika ada BOS M5 searah dengan bias H1 → keputusan = "bos" → lanjut ke AI-4
+- Jika ada MSS (BOS berlawanan arah) → keputusan = "mss" → arahkan AI-2 cari IDM baru
+- Jika belum ada BOS maupun MSS → keputusan = "wait" → set watchlist untuk konfirmasi
+
+WAJIB: balas HANYA JSON murni:
+{{
+  "decision": "bos|mss|wait",
+  "reason": "1 kalimat alasan keputusan",
+  "chat_msg": "pesan ke grup (1-2 kalimat, gaya WA — kalau MSS bilang ke AI-2 untuk cari IDM baru)",
+  "next": "AI-2|AI-4|wait",
+  "watchlist": [
+    {{"level": 0.0, "condition": "break_above|break_below", "reason": "BOS confirmation level", "for_ai": "AI-3|AI-4"}}
+  ]
+}}"""
+
+    raw = _call(client, model, prompt, max_tokens=280)
+    parsed = _parse_json(raw)
+    if not parsed:
+        logger.warning(f"[AI-3] Gagal parse: {raw[:100]}")
+        return {"decision": "wait", "reason": "parse error", "chat_msg": "", "next": "wait", "watchlist": []}
+
+    logger.info(f"[AI-3] decision={parsed.get('decision')} | next={parsed.get('next')}")
+    return parsed
+
+
+# ══════════════════════════════════════════════════════════
+# AI-4: ENTRY SNIPER
+# Tugas: cari entry presisi setelah BOS terkonfirmasi
+# Output: entry price, SL (MSNR close), TP target
+# Belajar dari memory trade historis
+# ══════════════════════════════════════════════════════════
+
+def ai4_entry_sniper(client: Groq, model: str, ict_data: dict,
+                     msnr_levels: list, current_price: float,
+                     bias: str, bos_level: float,
+                     trade_memory: list) -> dict:
+    """
+    AI-4 tentukan entry presisi, SL MSNR, TP.
+    Return: {"entry": float, "sl": float, "tp": float, "setup_type": str, "chat_msg": str, "confidence": float}
+    """
+    # Format memory trade (max 5 trade relevan)
+    mem_text = "Belum ada trade historis."
+    if trade_memory:
+        recent = trade_memory[-5:]
+        mem_text = "\n".join([
+            f"  [{t.get('result','?')}] {t.get('direction','?')} entry={t.get('entry',0):.2f} "
+            f"setup={t.get('setup','?')} notes={t.get('notes','')[:60]}"
+            for t in recent
+        ])
+
+    # MSNR levels
+    msnr_text = "\n".join([
+        f"  {m['type']}: {m['level']:.2f} ({m['source']})"
+        for m in msnr_levels[:4]
+    ]) or "  Tidak ada MSNR terdeteksi"
+
+    # FVG M5 untuk Quasimodo / retest area
+    fvgs_m5 = ict_data.get("m5_fvg", [])[:3]
+    fvg_text = "\n".join([
+        f"  {f['type'].upper()} FVG: {f['low']:.2f}–{f['high']:.2f} filled={f['filled']}"
+        for f in fvgs_m5
+    ]) or "  Tidak ada FVG M5"
+
+    ob_h1 = ict_data.get("h1_ob", [])[:2]
+    ob_text = "\n".join([
+        f"  {ob['type'].upper()} OB H1: {ob['low']:.2f}–{ob['high']:.2f}"
+        for ob in ob_h1
+    ]) or "  Tidak ada OB H1"
+
+    prompt = f"""Kamu adalah AI-4, spesialis entry presisi. Tidak pakai indikator — hanya candlestick.
+
+KONTEKS:
+Bias H1: {bias}
+BOS terkonfirmasi di: {bos_level:.2f}
+Harga saat ini: {current_price:.2f}
+
+LEVEL MSNR (Malaysian S/R — hanya close candle, wick diabaikan):
+{msnr_text}
+
+FVG M5 (potensi Quasimodo / retest):
+{fvg_text}
+
+OB H1:
+{ob_text}
+
+HISTORIS TRADE (belajar dari sini):
+{mem_text}
+
+TUGASMU:
+Tentukan entry PALING PRESISI berdasarkan setup ini. Gunakan angka PERSIS dari data.
+
+Pilihan setup entry (berdasarkan konteks):
+- RBS (Resistance Become Support): kalau harga retest level yang sebelumnya resistance
+- Quasimodo: kalau ada FVG M5 yang belum terisi dekat area BOS
+- OB retest: kalau harga pullback ke OB H1
+- MSNR support: kalau ada level close candle yang bersih
+
+SL: WAJIB di bawah level MSNR support (close candle, bukan wick) — gunakan harga PERSIS
+TP: ke liquidity pool berikutnya (swing high terakhir H1 atau recent_high)
+
+WAJIB: balas HANYA JSON murni:
+{{
+  "setup_type": "RBS|Quasimodo|OB_retest|MSNR_support",
+  "entry": 0.0,
+  "sl": 0.0,
+  "tp": 0.0,
+  "rr": 0.0,
+  "sl_reason": "level MSNR close yang jadi acuan SL",
+  "tp_reason": "target liquidity yang dituju",
+  "chat_msg": "pesan ke grup: setup apa, entry di mana, SL/TP (1-3 kalimat, gaya WA)",
+  "confidence": 0.0
+}}"""
+
+    raw = _call(client, model, prompt, max_tokens=400, temp=0.15)
+    parsed = _parse_json(raw)
+    if not parsed:
+        logger.warning(f"[AI-4] Gagal parse: {raw[:100]}")
+        return {"setup_type": "unknown", "entry": current_price, "sl": 0, "tp": 0,
+                "rr": 0, "chat_msg": "", "confidence": 0}
+
+    logger.info(f"[AI-4] setup={parsed.get('setup_type')} | entry={parsed.get('entry')} | "
+                f"sl={parsed.get('sl')} | tp={parsed.get('tp')} | conf={parsed.get('confidence')}")
+    return parsed
+
+
+# ══════════════════════════════════════════════════════════
+# LOSS DEBRIEF — Diskusi hanya saat loss
+# Analisis apa yang salah dari 4 AI
+# ══════════════════════════════════════════════════════════
+
+def loss_debrief(clients: list, models: list, closed_trade: dict, trade_context: dict) -> dict:
+    """
+    Panggil semua 4 AI untuk evaluasi trade yang loss.
+    Return: {"ai1_verdict": str, "ai2_verdict": str, "ai3_verdict": str, "ai4_verdict": str,
+             "root_cause": str, "lesson": str, "chat_log": list}
+    """
+    chat_log = []
+
+    trade_summary = (
+        f"Trade {closed_trade.get('direction','?').upper()} | "
+        f"Entry: {closed_trade.get('entry',0):.2f} | "
+        f"SL: {closed_trade.get('sl',0):.2f} | Exit: {closed_trade.get('exit_price',0):.2f} | "
+        f"PnL: {closed_trade.get('pnl',0):.4f} | Setup: {closed_trade.get('setup','?')}"
+    )
+
+    # Masing-masing AI evaluasi bagiannya
+    ai_names = ["AI-1 (H1)", "AI-2 (IDM)", "AI-3 (BOS/MSS)", "AI-4 (Entry)"]
+    ai_roles = [
+        "Apakah bias H1 sudah benar? Apakah OB/FVG yang digunakan valid?",
+        "Apakah IDM yang dipilih valid? Apakah level IDM sudah tepat?",
+        "Apakah keputusan BOS vs MSS sudah benar? Apakah seharusnya MSS tapi dilanjutkan?",
+        "Apakah entry, SL, dan TP sudah di level yang tepat? Apakah setup yang dipilih sesuai konteks?"
+    ]
+
+    verdicts = {}
+    for i, (client, model, name, role) in enumerate(zip(clients, models, ai_names, ai_roles)):
+        prompt = f"""Kamu adalah {name}. Ada trade yang loss — evaluasi bagianmu.
+
+TRADE YANG LOSS:
+{trade_summary}
+
+PERTANYAAN UNTUKMU:
+{role}
+
+Berikan evaluasi singkat 2-3 kalimat. Jujur, tidak perlu defensif.
+Format: "{name}: [evaluasimu]"
+Tulis HANYA pesanmu (plain text)."""
+
+        raw = _call(client, model, prompt, max_tokens=200, temp=0.4)
+        key = f"ai{i+1}_verdict"
+        verdicts[key] = raw
+        chat_log.append({"ai": f"ai{i+1}", "nama": name, "pesan": raw, "ronde": 1})
+        logger.info(f"[DEBRIEF {name}] {raw[:100]}")
+
+    # Kesimpulan root cause (pakai AI-3 yang paling sering salah)
+    debrief_text = "\n".join([f"{k}: {v}" for k, v in verdicts.items()])
+    prompt_rc = f"""Berdasarkan evaluasi 4 AI berikut setelah trade loss:
+
+{debrief_text}
+
+Trade: {trade_summary}
+
+Identifikasi:
+1. AI mana yang paling bertanggung jawab atas loss ini?
+2. Apa root cause utamanya?
+3. Apa 1 rule yang harus ditambahkan untuk mencegah hal ini terulang?
+
+WAJIB: balas HANYA JSON murni:
+{{
+  "culprit": "AI-1|AI-2|AI-3|AI-4|kombinasi",
+  "root_cause": "penjelasan singkat",
+  "new_rule": "rule baru yang harus diterapkan",
+  "lesson": "1 kalimat pelajaran"
+}}"""
+
+    raw_rc = _call(clients[2], models[2], prompt_rc, max_tokens=250, temp=0.3)
+    rc = _parse_json(raw_rc) or {
+        "culprit": "unknown", "root_cause": "parse error",
+        "new_rule": "", "lesson": "review manual diperlukan"
+    }
+
+    chat_log.append({
+        "ai": "system",
+        "nama": "📋 Debrief",
+        "pesan": f"Root cause: {rc.get('culprit')} — {rc.get('root_cause')} | Rule baru: {rc.get('new_rule')}",
+        "ronde": 2
+    })
+
+    return {**verdicts, **rc, "chat_log": chat_log}
